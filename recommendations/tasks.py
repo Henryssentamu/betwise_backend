@@ -9,10 +9,15 @@ deploy:
   - evaluate_finished_recommendations every 15 minutes
 """
 from celery import shared_task
+from django.db import transaction
 from django.db.models import Q
 
 from matches.models import Team, Match
-from .engine import generate_recommendation_for_match, evaluate_recommendation_outcome
+from .engine import (
+    generate_recommendation_for_match,
+    evaluate_recommendation_outcome,
+    sync_bet_logs_for_recommendation,
+)
 from .models import Recommendation
 
 
@@ -74,4 +79,6 @@ def evaluate_finished_recommendations() -> None:
         outcome="pending", match__status="finished"
     ).select_related("match")
     for recommendation in pending:
-        evaluate_recommendation_outcome(recommendation)
+        with transaction.atomic():
+            evaluate_recommendation_outcome(recommendation)
+            sync_bet_logs_for_recommendation(recommendation)

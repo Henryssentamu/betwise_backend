@@ -29,7 +29,7 @@ class WeeklyTargetSerializer(serializers.ModelSerializer):
         model = WeeklyTarget
         fields = [
             "id", "week_number", "week_starts_on", "target_stake_ugx",
-            "target_odds_to_chase", "actual_invested_ugx", "actual_earned_ugx",
+            "target_odds_to_chase",
         ]
 
 
@@ -67,6 +67,25 @@ class UserBetLogSerializer(serializers.ModelSerializer):
             "followed_recommendation", "result", "payout_ugx", "logged_at",
         ]
         read_only_fields = ["id", "logged_at"]
+
+
+class UserBetLogUpdateSerializer(serializers.ModelSerializer):
+    """
+    Lets a client self-report the outcome of a bet the system couldn't
+    resolve automatically (one it didn't recommend). Recommendation-linked
+    bets resolve on their own once the match finishes — see
+    engine.sync_bet_logs_for_recommendation.
+    """
+    class Meta:
+        model = UserBetLog
+        fields = ["result", "payout_ugx"]
+
+    def validate(self, attrs):
+        if self.instance.followed_recommendation and self.instance.recommendation_id is not None:
+            raise serializers.ValidationError(
+                "This bet is linked to a recommendation and resolves automatically."
+            )
+        return attrs
 
 
 class PromoCodeValidateSerializer(serializers.Serializer):

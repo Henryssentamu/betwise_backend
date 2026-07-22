@@ -1,5 +1,6 @@
 import uuid
 from datetime import date
+from decimal import Decimal
 
 from django.conf import settings
 from django.db.models import Count, Q
@@ -18,9 +19,14 @@ from .models import (
 from .serializers import (
     RecommendationSerializer, BettingPartnerSerializer,
     SeasonPlanCreateSerializer, SeasonPlanDetailSerializer,
-    UserBetLogSerializer, PromoCodeValidateSerializer, CheckoutSerializer,
+    UserBetLogSerializer, UserBetLogUpdateSerializer,
+    PromoCodeValidateSerializer, CheckoutSerializer,
 )
-from .planning import generate_weekly_targets, pace_summary, suggest_course_correction
+from .planning import (
+    generate_weekly_targets, pace_summary, suggest_course_correction,
+    week_count, current_week_number, week_summary, daily_breakdown_for_week,
+    monthly_summary, weekly_bet_frequency_advice,
+)
 from .pesapal import PesapalClient, PESAPAL_STATUS_MAP
 
 
@@ -120,17 +126,127 @@ class SeasonPacedashboardView(APIView):
         return Response(summary)
 
 
-class UserBetLogCreateView(generics.CreateAPIView):
+class WeekDetailView(APIView):
+    """
+    GET /api/season-plans/active/weeks/<week_number>/
+    week_number is either an integer or the literal "current". Powers the
+    "This week" screen: budget/odds for the week, the daily breakdown
+    (match-days only), and bet-frequency advice.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, week_number):
+        plan = SeasonPlan.objects.filter(user=request.user.profile, is_active=True).first()
+        if not plan:
+            return Response({"detail": "No active season plan."}, status=status.HTTP_404_NOT_FOUND)
+
+        if week_number == "current":
+            resolved_week_number = min(current_week_number(plan, date.today()), week_count(plan))
+        else:
+            try:
+                resolved_week_number = int(week_number)
+            except ValueError:
+                return Response({"detail": "week_number must be an integer or 'current'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        weekly_target = plan.weekly_targets.filter(week_number=resolved_week_number).first()
+        if not weekly_target:
+            return Response({"detail": "No such week."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            **week_summary(plan, weekly_target),
+            "daily_breakdown": daily_breakdown_for_week(plan, weekly_target),
+            "bet_frequency_advice": weekly_bet_frequency_advice(plan, weekly_target),
+        })
+
+
+class MonthlyBreakdownView(APIView):
+    """
+    GET /api/season-plans/active/months/
+    Rolls weekly targets up into season-relative "months" (4-week blocks).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        plan = SeasonPlan.objects.filter(user=request.user.profile, is_active=True).first()
+        if not plan:
+            return Response({"detail": "No active season plan."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"months": monthly_summary(plan)})
+
+
+class UserBetLogCreateView(generics.ListCreateAPIView):
+    """
+    GET /api/bet-logs/ — the requesting user's bet logs, most recent first.
+    POST /api/bet-logs/ — log a new bet.
+    """
     serializer_class = UserBetLogSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return UserBetLog.objects.filter(user=self.request.user.profile).order_by("-logged_at")
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user.profile)
 
 
+class UserBetLogUpdateView(generics.UpdateAPIView):
+    """
+    PATCH /api/bet-logs/<id>/
+    Lets a client self-report the result of a bet the system can't resolve
+    on its own (one it didn't recommend, or logged with
+    followed_recommendation=False). Recommendation-linked bets 400 here —
+    they resolve automatically once the match finishes.
+    """
+    serializer_class = UserBetLogUpdateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["patch"]
+
+    def get_queryset(self):
+        return UserBetLog.objects.filter(user=self.request.user.profile)
+
+
 # ---------------------------------------------------------------------------
 # Promo codes + checkout (Pesapal)
 # ---------------------------------------------------------------------------
+
+def activate_subscription(transaction: PesapalTransaction) -> None:
+    """
+    Grants the plan on a completed (or promo-covered) transaction. Shared by
+    PesapalIPNView (real payment confirmed) and CheckoutView (100%-off promo,
+    no payment ever happens).
+    """
+    from dateutil.relativedelta import relativedelta
+
+    if Subscription.objects.filter(
+        user=transaction.user, plan=transaction.plan, status="active"
+    ).exists():
+        return  # already activated (IPN can fire more than once)
+
+    starts_at = timezone.now()
+    ends_at = (
+        starts_at + relativedelta(months=1)
+        if transaction.plan.billing_cycle == "monthly"
+        else starts_at + relativedelta(months=9)  # season ~ 9 months
+    )
+    Subscription.objects.create(
+        user=transaction.user,
+        plan=transaction.plan,
+        status="active",
+        starts_at=starts_at,
+        ends_at=ends_at,
+    )
+
+    if transaction.promo_code:
+        promo = transaction.promo_code
+        PromoCodeRedemption.objects.create(
+            promo_code=promo,
+            user=transaction.user,
+            plan=transaction.plan,
+            original_price_ugx=transaction.plan.price_ugx,
+            discounted_price_ugx=transaction.amount_ugx,
+        )
+        promo.times_redeemed += 1
+        promo.save(update_fields=["times_redeemed"])
+
 
 class PromoCodeValidateView(APIView):
     """
@@ -161,6 +277,10 @@ class CheckoutView(APIView):
     POST /api/checkout/  {"plan_id": 2, "promo_code": "LAUNCH50"}
     Creates a PesapalTransaction and returns the redirect_url for the
     frontend to send the user to Pesapal's hosted payment page.
+
+    If a promo code brings the price to 0, there's nothing to pay — the
+    subscription is granted immediately and `payment_required: false` is
+    returned with no `redirect_url`, so the frontend skips Pesapal entirely.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -188,6 +308,25 @@ class CheckoutView(APIView):
 
         profile = request.user.profile
         merchant_reference = f"BW-{uuid.uuid4().hex[:12].upper()}"
+
+        if amount <= Decimal("0"):
+            # Promo covers the full price — grant the plan directly, no
+            # Pesapal order needed since there's nothing to pay.
+            transaction = PesapalTransaction.objects.create(
+                user=profile,
+                plan=plan,
+                promo_code=promo,
+                merchant_reference=merchant_reference,
+                amount_ugx=Decimal("0"),
+                status="completed",
+                status_description="Fully covered by promo code",
+            )
+            activate_subscription(transaction)
+            return Response({
+                "merchant_reference": merchant_reference,
+                "payment_required": False,
+                "redirect_url": None,
+            })
 
         transaction = PesapalTransaction.objects.create(
             user=profile,
@@ -225,6 +364,7 @@ class CheckoutView(APIView):
 
         return Response({
             "merchant_reference": merchant_reference,
+            "payment_required": True,
             "redirect_url": result.get("redirect_url"),
         })
 
@@ -261,43 +401,9 @@ class PesapalIPNView(APIView):
         transaction.save(update_fields=["status", "status_description", "order_tracking_id"])
 
         if mapped_status == "completed":
-            self._activate_subscription(transaction)
+            activate_subscription(transaction)
 
         return Response({"status": mapped_status})
-
-    def _activate_subscription(self, transaction: PesapalTransaction):
-        from dateutil.relativedelta import relativedelta
-
-        if Subscription.objects.filter(
-            user=transaction.user, plan=transaction.plan, status="active"
-        ).exists():
-            return  # already activated (IPN can fire more than once)
-
-        starts_at = timezone.now()
-        ends_at = (
-            starts_at + relativedelta(months=1)
-            if transaction.plan.billing_cycle == "monthly"
-            else starts_at + relativedelta(months=9)  # season ~ 9 months
-        )
-        Subscription.objects.create(
-            user=transaction.user,
-            plan=transaction.plan,
-            status="active",
-            starts_at=starts_at,
-            ends_at=ends_at,
-        )
-
-        if transaction.promo_code:
-            promo = transaction.promo_code
-            PromoCodeRedemption.objects.create(
-                promo_code=promo,
-                user=transaction.user,
-                plan=transaction.plan,
-                original_price_ugx=transaction.plan.price_ugx,
-                discounted_price_ugx=transaction.amount_ugx,
-            )
-            promo.times_redeemed += 1
-            promo.save(update_fields=["times_redeemed"])
 
 
 # ---------------------------------------------------------------------------

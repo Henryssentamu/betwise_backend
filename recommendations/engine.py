@@ -11,6 +11,7 @@ it's auditable, and the weights below are the first thing to tune once
 backtesting (see the QA target of 5-10% error margin) shows where it's off.
 """
 from dataclasses import dataclass
+from decimal import Decimal
 
 from matches.models import Match, HeadToHead
 from .models import Recommendation
@@ -196,3 +197,23 @@ def evaluate_recommendation_outcome(recommendation: Recommendation) -> None:
     recommendation.outcome = "hit" if predicted == match.result else "missed"
     recommendation.outcome_evaluated_at = timezone.now()
     recommendation.save(update_fields=["outcome", "outcome_evaluated_at"])
+
+
+def sync_bet_logs_for_recommendation(recommendation: Recommendation) -> None:
+    """
+    Resolves self-reported bet logs that followed this recommendation and
+    are still pending, now that its outcome is known. Bets not linked to a
+    recommendation, or logged with followed_recommendation=False, are left
+    alone — the system has no ground truth for a bet it didn't recommend.
+    """
+    if recommendation.outcome not in ("hit", "missed"):
+        return
+
+    won = recommendation.outcome == "hit"
+    for log in recommendation.bet_logs.filter(followed_recommendation=True, result="pending"):
+        log.result = "won" if won else "lost"
+        log.payout_ugx = (
+            (log.stake_ugx * Decimal(str(log.odds_taken))).quantize(Decimal("0.01"))
+            if won else Decimal("0.00")
+        )
+        log.save(update_fields=["result", "payout_ugx"])

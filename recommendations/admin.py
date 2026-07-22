@@ -21,7 +21,10 @@ class BettingPartnerAdmin(admin.ModelAdmin):
 class WeeklyTargetInline(admin.TabularInline):
     model = WeeklyTarget
     extra = 0
-    readonly_fields = ("week_number", "week_starts_on")
+    # actual_invested_ugx/actual_earned_ugx are no longer used — actuals are
+    # now computed live from UserBetLog (see recommendations/planning.py) —
+    # readonly here so staff aren't misled into thinking editing them does anything.
+    readonly_fields = ("week_number", "week_starts_on", "actual_invested_ugx", "actual_earned_ugx")
 
 
 @admin.register(SeasonPlan)
