@@ -13,6 +13,6 @@ trap cleanup EXIT INT TERM
 
 celery -A config worker -l info &
 celery -A config beat -l info &
-python manage.py runserver
+python manage.py runserver 0.0.0.0:8000
 
 wait

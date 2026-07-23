@@ -44,7 +44,7 @@ class RecommendationListView(generics.ListAPIView):
     serializer_class = RecommendationSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["risk_tier", "bet_type"]
+    filterset_fields = ["risk_tier", "bet_type", "match"]
 
     def get_queryset(self):
         profile = self.request.user.profile
