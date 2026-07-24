@@ -18,16 +18,16 @@ def _calculate_age(dob: date) -> int:
 
 class SignupSerializer(serializers.Serializer):
     """
-    Handles account creation + age verification in one step. National ID
-    number and date of birth are required at signup per the legal
-    requirement that only 18+ users can access recommendations.
+    Handles account creation + age verification in one step. Date of birth
+    is required at signup per the legal requirement that only 18+ users
+    can access recommendations.
     """
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, validators=[validate_password])
-    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    country = serializers.CharField(max_length=64)
+    phone_number = serializers.CharField(max_length=20)
     date_of_birth = serializers.DateField()
-    national_id_number = serializers.CharField(max_length=64)
     default_risk_appetite = serializers.ChoiceField(
         choices=User.RISK_APPETITE_CHOICES, default="medium"
     )
@@ -59,9 +59,9 @@ class SignupSerializer(serializers.Serializer):
         )
         profile = User.objects.create(
             auth_user=auth_user,
-            phone_number=validated_data.get("phone_number", ""),
+            country=validated_data["country"],
+            phone_number=validated_data["phone_number"],
             date_of_birth=validated_data["date_of_birth"],
-            national_id_number=validated_data["national_id_number"],
             default_risk_appetite=validated_data["default_risk_appetite"],
             # Age already validated above, so verification is granted immediately.
             # Swap to False + a manual review step if you want ID documents checked
@@ -79,7 +79,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            "id", "username", "email", "phone_number", "country",
+            "id", "username", "email", "phone_number", "country", "date_of_birth",
             "is_age_verified", "default_risk_appetite", "created_at",
         ]
         read_only_fields = ["id", "is_age_verified", "created_at"]
